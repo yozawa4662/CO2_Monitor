@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
 #include <ESPmDNS.h>
+#include <esp_wifi.h>
 
 const long SENSOR_BAUDRATE = 9600;
 const long DEBUG_BAUDRATE = 115200;
@@ -14,9 +15,21 @@ const int SERIAL_CHANNEL = 1;
 const unsigned long WARMUP_TIME_MS = 180000; // 3分間
 const unsigned long SENSOR_UPDATE_INTERVAL = 5000; // 5秒間
 const uint32_t WDT_TIMEOUT_S = 30; // 30秒
+const unsigned long WIFI_RECONNECT_TIMEOUT_MS = 600000; // 10分間
+const unsigned long RESTART_DELAY_MS = 1000;
+const int CO2_MIN_VALID = 1;
+const int CO2_MAX_VALID = 10000;
 
-const char* VERSION = "1.0.0";
+const char* VERSION = "1.1.0";
 const uint32_t TOTAL_HEAP = 327680;
+
+// 前方宣言
+void connectWiFi();
+void checkWiFiStatus();
+void setupMDNS();
+void updateSensorData();
+void handleRoot();
+void handleCalibrate();
 
 WebServer server(HTTP_PORT);
 MHZ19 myMHZ19;
@@ -48,13 +61,26 @@ void connectWiFi() {
 // WiFi接続状態の監視
 void checkWiFiStatus() {
     static bool lastConnected = false;
+    static unsigned long lastDisconnectedTime = 0;
     bool currentlyConnected = (WiFi.status() == WL_CONNECTED);
 
     if (currentlyConnected && !lastConnected) {
         Serial.print("WiFi Reconnected. IP: ");
         Serial.println(WiFi.localIP());
+        setupMDNS(); // 再接続時にmDNSを再設定
+        lastDisconnectedTime = 0;
     } else if (!currentlyConnected && lastConnected) {
         Serial.println("WiFi Disconnected. Waiting for auto-reconnect...");
+        lastDisconnectedTime = millis();
+    }
+
+    // 長時間接続できない場合は再起動
+    if (!currentlyConnected && lastDisconnectedTime != 0) {
+        if (millis() - lastDisconnectedTime > WIFI_RECONNECT_TIMEOUT_MS) { 
+            Serial.println("WiFi connection lost for too long. Restarting...");
+            delay(RESTART_DELAY_MS);
+            ESP.restart();
+        }
     }
     lastConnected = currentlyConnected;
 }
@@ -74,13 +100,15 @@ void updateSensorData() {
     if (millis() - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL) {
         int co2 = myMHZ19.getCO2();
 
-        // センサーの妥当性チェック (0以下や特定のエラー値は異常とみなす)
-        if (co2 > 0 && co2 < 10000) {
+        // センサーの妥当性チェック
+        if (co2 >= CO2_MIN_VALID && co2 <= CO2_MAX_VALID) {
             cachedCo2 = co2;
             cachedTemp = myMHZ19.getTemperature();
             cachedAccuracy = myMHZ19.getAccuracy();
             sensorValid = true;
         } else {
+            Serial.print("Sensor error: Invalid CO2 value received: ");
+            Serial.println(co2);
             sensorValid = false;
         }
 
@@ -141,6 +169,10 @@ void setup() {
     esp_task_wdt_add(NULL);
 
     connectWiFi();
+    // WiFiの省電力モードを無効化して安定性を向上させる
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    Serial.println("WiFi Power Save disabled");
+
     setupMDNS();
     updateSensorData();
 
