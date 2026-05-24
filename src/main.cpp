@@ -5,6 +5,13 @@
 #include <esp_task_wdt.h>
 #include <ESPmDNS.h>
 #include <esp_wifi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// credentials.ini で定義することを想定。定義されていない場合のフォールバック。
+#ifndef GAS_URL
+#define GAS_URL "YOUR_GAS_URL_HERE"
+#endif
 
 const long SENSOR_BAUDRATE = 9600;
 const long DEBUG_BAUDRATE = 115200;
@@ -16,11 +23,12 @@ const unsigned long WARMUP_TIME_MS = 180000; // 3分間
 const unsigned long SENSOR_UPDATE_INTERVAL = 5000; // 5秒間
 const uint32_t WDT_TIMEOUT_S = 30; // 30秒
 const unsigned long WIFI_RECONNECT_TIMEOUT_MS = 600000; // 10分間
+const unsigned long LOG_INTERVAL_MS = 300000; // 5分間
 const unsigned long RESTART_DELAY_MS = 1000;
 const int CO2_MIN_VALID = 1;
 const int CO2_MAX_VALID = 10000;
 
-const char* VERSION = "1.1.0";
+const char* VERSION = "1.2.0";
 const uint32_t TOTAL_HEAP = 327680;
 
 // 前方宣言
@@ -30,6 +38,7 @@ void setupMDNS();
 void updateSensorData();
 void handleRoot();
 void handleCalibrate();
+void sendLogToGAS();
 
 WebServer server(HTTP_PORT);
 MHZ19 myMHZ19;
@@ -41,7 +50,7 @@ int cachedTemp = 0;
 int cachedAccuracy = 0;
 bool sensorValid = false;
 unsigned long lastSensorUpdate = 0;
-
+uint32_t minFreeHeap = TOTAL_HEAP;
 
 // WiFi接続処理
 void connectWiFi() {
@@ -83,6 +92,63 @@ void checkWiFiStatus() {
         }
     }
     lastConnected = currentlyConnected;
+}
+
+// GASへのログ送信
+void sendLogToGAS() {
+    static unsigned long lastLogTime = 0;
+    if (millis() - lastLogTime < LOG_INTERVAL_MS && lastLogTime != 0) return;
+    
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure(); // GASへのHTTPS通信を簡易化
+
+    Serial.println("Sending log to GAS...");
+    
+    // 自動リダイレクトを無効化し、手動で処理（HTTP 400対策）
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+
+    if (http.begin(client, GAS_URL)) {
+        http.addHeader("Content-Type", "application/json");
+        
+        JsonDocument doc;
+        doc["co2"] = cachedCo2;
+        doc["temp"] = cachedTemp;
+        doc["accuracy"] = cachedAccuracy;
+        doc["free_heap"] = ESP.getFreeHeap();
+        doc["min_free_heap"] = minFreeHeap;
+        doc["rssi"] = WiFi.RSSI();
+        doc["uptime"] = millis() / 1000;
+        
+        String json;
+        serializeJson(doc, json);
+        
+        int httpCode = http.POST(json);
+
+        // 302 Found (リダイレクト) の手動処理
+        if (httpCode == 302 || httpCode == 301) {
+            String newUrl = http.getLocation();
+            Serial.print("Redirecting to: ");
+            Serial.println(newUrl);
+            http.end();
+            
+            // 新しいURLでGETリクエスト（ヘッダーをクリーンにするため）
+            http.begin(client, newUrl);
+            httpCode = http.GET();
+        }
+
+        if (httpCode > 0) {
+            Serial.printf("[HTTP] Result code: %d\n", httpCode);
+            String payload = http.getString();
+            Serial.println("Response body: " + payload);
+        } else {
+            Serial.printf("[HTTP] Failed, error: %s\n", http.errorToString(httpCode).c_str());
+        }
+        http.end();
+        lastLogTime = millis();
+    }
 }
 
 // mDNSの設定
@@ -129,7 +195,9 @@ String createJsonResponse(int co2, int temp, int accuracy, String status) {
     uint32_t freeHeap = ESP.getFreeHeap();
     system["uptime"] = millis() / 1000;
     system["free_heap"] = freeHeap;
+    system["min_free_heap"] = minFreeHeap;
     system["free_heap_percent"] = (freeHeap * 100) / TOTAL_HEAP;
+    system["rssi"] = WiFi.RSSI();
     system["version"] = VERSION;
 
     String json;
@@ -155,7 +223,7 @@ void handleRoot() {
 // キャリブレーションのハンドラ
 void handleCalibrate() {
     myMHZ19.calibrateZero();
-    server.send(200, "text/plain", "");
+    server.send(200, "text/plain", "Calibrating...");
 }
 
 void setup() {
@@ -169,9 +237,9 @@ void setup() {
     esp_task_wdt_add(NULL);
 
     connectWiFi();
-    // WiFiの省電力モードを無効化して安定性を向上させる
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    Serial.println("WiFi Power Save disabled");
+    // WiFiの省電力モードを有効化（発熱対策）
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    Serial.println("WiFi Power Save enabled");
 
     setupMDNS();
     updateSensorData();
@@ -183,7 +251,15 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
+    
+    // 最小メモリ残量の更新
+    uint32_t currentFreeHeap = ESP.getFreeHeap();
+    if (currentFreeHeap < minFreeHeap) {
+        minFreeHeap = currentFreeHeap;
+    }
+
     checkWiFiStatus();
     updateSensorData();
     server.handleClient();
+    sendLogToGAS();
 }
