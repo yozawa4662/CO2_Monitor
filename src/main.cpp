@@ -13,6 +13,22 @@
 #define GAS_URL "YOUR_GAS_URL_HERE"
 #endif
 
+#ifndef DISPLAY_URL
+#define DISPLAY_URL "http://192.168.0.100:8000/data"
+#endif
+
+#ifndef DEVICE_ID
+#define DEVICE_ID "co2-monitor-01"
+#endif
+
+#ifndef ENABLE_GAS
+#define ENABLE_GAS 0
+#endif
+
+#ifndef ENABLE_HTTP_SERVER
+#define ENABLE_HTTP_SERVER 0
+#endif
+
 const long SENSOR_BAUDRATE = 9600;
 const long DEBUG_BAUDRATE = 115200;
 const int HTTP_PORT = 80;
@@ -24,11 +40,12 @@ const unsigned long SENSOR_UPDATE_INTERVAL = 5000; // 5秒間
 const uint32_t WDT_TIMEOUT_S = 30; // 30秒
 const unsigned long WIFI_RECONNECT_TIMEOUT_MS = 600000; // 10分間
 const unsigned long LOG_INTERVAL_MS = 300000; // 5分間
+const unsigned long DISPLAY_INTERVAL_MS = 30000; // 30秒間
 const unsigned long RESTART_DELAY_MS = 1000;
 const int CO2_MIN_VALID = 1;
 const int CO2_MAX_VALID = 10000;
 
-const char* VERSION = "1.2.0";
+const char* VERSION = "1.3.0";
 const uint32_t TOTAL_HEAP = 327680;
 
 // 前方宣言
@@ -36,11 +53,16 @@ void connectWiFi();
 void checkWiFiStatus();
 void setupMDNS();
 void updateSensorData();
+#if ENABLE_HTTP_SERVER
 void handleRoot();
 void handleCalibrate();
+#endif
 void sendLogToGAS();
+void sendToDisplay();
 
+#if ENABLE_HTTP_SERVER
 WebServer server(HTTP_PORT);
+#endif
 MHZ19 myMHZ19;
 HardwareSerial mySerial(SERIAL_CHANNEL);
 
@@ -76,7 +98,9 @@ void checkWiFiStatus() {
     if (currentlyConnected && !lastConnected) {
         Serial.print("WiFi Reconnected. IP: ");
         Serial.println(WiFi.localIP());
+#if ENABLE_HTTP_SERVER
         setupMDNS(); // 再接続時にmDNSを再設定
+#endif
         lastDisconnectedTime = 0;
     } else if (!currentlyConnected && lastConnected) {
         Serial.println("WiFi Disconnected. Waiting for auto-reconnect...");
@@ -85,7 +109,7 @@ void checkWiFiStatus() {
 
     // 長時間接続できない場合は再起動
     if (!currentlyConnected && lastDisconnectedTime != 0) {
-        if (millis() - lastDisconnectedTime > WIFI_RECONNECT_TIMEOUT_MS) { 
+        if (millis() - lastDisconnectedTime > WIFI_RECONNECT_TIMEOUT_MS) {
             Serial.println("WiFi connection lost for too long. Restarting...");
             delay(RESTART_DELAY_MS);
             ESP.restart();
@@ -94,11 +118,48 @@ void checkWiFiStatus() {
     lastConnected = currentlyConnected;
 }
 
+// CO2_Displayへのデータ送信
+void sendToDisplay() {
+    static unsigned long lastDisplayTime = 0;
+    if (millis() - lastDisplayTime < DISPLAY_INTERVAL_MS && lastDisplayTime != 0) return;
+
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (!sensorValid) return;
+
+    HTTPClient http;
+    WiFiClient client;
+
+    Serial.println("Sending data to CO2_Display...");
+
+    if (http.begin(client, DISPLAY_URL)) {
+        http.addHeader("Content-Type", "application/json");
+
+        JsonDocument doc;
+        doc["device_id"] = DEVICE_ID;
+        doc["co2"] = cachedCo2;
+        doc["temperature"] = cachedTemp;
+
+        String json;
+        serializeJson(doc, json);
+
+        int httpCode = http.POST(json);
+
+        if (httpCode > 0) {
+            Serial.printf("[Display] Result code: %d\n", httpCode);
+        } else {
+            Serial.printf("[Display] Failed, error: %s\n", http.errorToString(httpCode).c_str());
+        }
+        http.end();
+        lastDisplayTime = millis();
+    }
+}
+
 // GASへのログ送信
 void sendLogToGAS() {
+    if (!ENABLE_GAS) return;
     static unsigned long lastLogTime = 0;
     if (millis() - lastLogTime < LOG_INTERVAL_MS && lastLogTime != 0) return;
-    
+
     if (WiFi.status() != WL_CONNECTED) return;
 
     HTTPClient http;
@@ -106,13 +167,13 @@ void sendLogToGAS() {
     client.setInsecure(); // GASへのHTTPS通信を簡易化
 
     Serial.println("Sending log to GAS...");
-    
+
     // 自動リダイレクトを無効化し、手動で処理（HTTP 400対策）
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
 
     if (http.begin(client, GAS_URL)) {
         http.addHeader("Content-Type", "application/json");
-        
+
         JsonDocument doc;
         doc["co2"] = cachedCo2;
         doc["temp"] = cachedTemp;
@@ -121,10 +182,10 @@ void sendLogToGAS() {
         doc["min_free_heap"] = minFreeHeap;
         doc["rssi"] = WiFi.RSSI();
         doc["uptime"] = millis() / 1000;
-        
+
         String json;
         serializeJson(doc, json);
-        
+
         int httpCode = http.POST(json);
 
         // 302 Found (リダイレクト) の手動処理
@@ -133,7 +194,7 @@ void sendLogToGAS() {
             Serial.print("Redirecting to: ");
             Serial.println(newUrl);
             http.end();
-            
+
             // 新しいURLでGETリクエスト（ヘッダーをクリーンにするため）
             http.begin(client, newUrl);
             httpCode = http.GET();
@@ -205,6 +266,7 @@ String createJsonResponse(int co2, int temp, int accuracy, String status) {
     return json;
 }
 
+#if ENABLE_HTTP_SERVER
 // Webサーバーのハンドラ
 void handleRoot() {
     String status;
@@ -225,6 +287,7 @@ void handleCalibrate() {
     myMHZ19.calibrateZero();
     server.send(200, "text/plain", "Calibrating...");
 }
+#endif
 
 void setup() {
     Serial.begin(DEBUG_BAUDRATE);
@@ -241,17 +304,21 @@ void setup() {
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     Serial.println("WiFi Power Save enabled");
 
+#if ENABLE_HTTP_SERVER
     setupMDNS();
+#endif
     updateSensorData();
 
+#if ENABLE_HTTP_SERVER
     server.on("/sensor", handleRoot);
     server.on("/calibrate", HTTP_POST, handleCalibrate);
     server.begin();
+#endif
 }
 
 void loop() {
     esp_task_wdt_reset();
-    
+
     // 最小メモリ残量の更新
     uint32_t currentFreeHeap = ESP.getFreeHeap();
     if (currentFreeHeap < minFreeHeap) {
@@ -260,6 +327,9 @@ void loop() {
 
     checkWiFiStatus();
     updateSensorData();
+#if ENABLE_HTTP_SERVER
     server.handleClient();
+#endif
+    sendToDisplay();
     sendLogToGAS();
 }
