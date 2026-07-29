@@ -144,6 +144,7 @@ void sendToDisplay() {
 
         if (httpCode > 0) {
             Serial.printf("[Display] Result code: %d\n", httpCode);
+            Serial.println(json);
         } else {
             Serial.printf("[Display] Failed, error: %s\n", http.errorToString(httpCode).c_str());
         }
