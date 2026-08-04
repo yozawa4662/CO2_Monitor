@@ -39,14 +39,20 @@ const float BME_PRESS_MIN = 870.0F;
 const float BME_PRESS_MAX = 1100.0F;
 const float BME_HUM_MIN   =   0.0F;
 const float BME_HUM_MAX   = 100.0F;
+// 5秒間隔での急激な変化を異常値として扱うしきい値
+const float BME_MAX_TEMP_CHANGE = 2.0F;   // °C / 測定
+const float BME_MAX_HUM_CHANGE  = 10.0F;  // %RH / 測定
+const float BME_MAX_PRESS_CHANGE = 3.0F;  // hPa / 測定
 const int   BME_MAX_ERRORS = 3; // 連続エラーがこの回数を超えたら再初期化
 
 // 前方宣言
 void connectWiFi();
 void checkWiFiStatus();
 void updateSensorData();
-bool setupBME280();
+bool setupBME280(bool reinit = false);
 void sendToDisplay();
+void recoverI2CBus();
+void scanI2CBus();
 
 MHZ19 myMHZ19;
 HardwareSerial mySerial(SERIAL_CHANNEL);
@@ -59,6 +65,10 @@ int cachedTemp = 0;       // MH-Z19B 内部温度（整数）
 float cachedBmeTemp = NAN;     // BME280 温度 [°C]
 float cachedBmeHumidity = NAN; // BME280 湿度 [%RH]
 float cachedBmePressure = NAN; // BME280 気圧 [hPa]
+float previousBmeTemp = NAN;
+float previousBmeHumidity = NAN;
+float previousBmePressure = NAN;
+bool hasPreviousBmeReading = false;
 bool sensorValid = false;
 unsigned long lastSensorUpdate = 0;
 
@@ -155,11 +165,66 @@ void sendToDisplay() {
 
 
 
+// I2C バスリカバリ（SDA スタック解消）
+void recoverI2CBus() {
+    Serial.println("[I2C] Attempting bus recovery...");
+    pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+    pinMode(I2C_SCL_PIN, OUTPUT);
+
+    // SCL を最大9回トグルしてスタックしたスレーブを解放
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(I2C_SCL_PIN, LOW);
+        delayMicroseconds(5);
+        digitalWrite(I2C_SCL_PIN, HIGH);
+        delayMicroseconds(5);
+        if (digitalRead(I2C_SDA_PIN)) {
+            Serial.printf("[I2C] Bus released after %d clock pulse(s)\n", i + 1);
+            break;
+        }
+    }
+
+    // STOP condition を生成
+    pinMode(I2C_SDA_PIN, OUTPUT);
+    digitalWrite(I2C_SDA_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SDA_PIN, HIGH);
+    delayMicroseconds(5);
+
+    Serial.printf("[I2C] SDA=%d SCL=%d after recovery\n",
+                  digitalRead(I2C_SDA_PIN), digitalRead(I2C_SCL_PIN));
+}
+
+// I2C バススキャン（デバッグ用）
+void scanI2CBus() {
+    Serial.println("[I2C] Scanning bus...");
+    int found = 0;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        uint8_t error = Wire.endTransmission();
+        if (error == 0) {
+            Serial.printf("[I2C] Device found at 0x%02X\n", addr);
+            found++;
+        }
+    }
+    Serial.printf("[I2C] Scan complete. %d device(s) found.\n", found);
+}
+
 // BME280 の初期化（再試行対応）
-bool setupBME280() {
+bool setupBME280(bool reinit) {
+    if (reinit) {
+        Serial.println("[BME280] Re-initializing (Wire.end -> recovery -> Wire.begin)...");
+        Wire.end();
+        delay(10);
+        recoverI2CBus();
+    }
+
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(100000); // 100kHz (Standard mode) — 400kHz より安定
     delay(10);             // バス安定待ち
+
+    scanI2CBus(); // デバイスがバス上に見えるか確認
 
     if (!bme.begin(BME280_I2C_ADDR)) {
         // アドレスを反転して再試行（0x76 <-> 0x77）
@@ -211,24 +276,50 @@ void updateSensorData() {
             bool tempOk  = !isnan(rawTemp)  && rawTemp  >= BME_TEMP_MIN  && rawTemp  <= BME_TEMP_MAX;
             bool humOk   = !isnan(rawHum)   && rawHum   >= BME_HUM_MIN   && rawHum   <= BME_HUM_MAX;
             bool pressOk = !isnan(rawPress) && rawPress >= BME_PRESS_MIN && rawPress <= BME_PRESS_MAX;
+            bool changeOk = !hasPreviousBmeReading ||
+                            (fabsf(rawTemp - previousBmeTemp) <= BME_MAX_TEMP_CHANGE &&
+                             fabsf(rawHum - previousBmeHumidity) <= BME_MAX_HUM_CHANGE &&
+                             fabsf(rawPress - previousBmePressure) <= BME_MAX_PRESS_CHANGE);
 
-            if (tempOk && humOk && pressOk) {
+            if (tempOk && humOk && pressOk && changeOk) {
                 cachedBmeTemp     = rawTemp;
                 cachedBmeHumidity = rawHum;
                 cachedBmePressure = rawPress;
+                previousBmeTemp = rawTemp;
+                previousBmeHumidity = rawHum;
+                previousBmePressure = rawPress;
+                hasPreviousBmeReading = true;
                 bmeErrorCount = 0;
                 Serial.printf("[BME280] Temp: %.1f°C  Hum: %.1f%%  Press: %.1f hPa\n",
                               cachedBmeTemp, cachedBmeHumidity, cachedBmePressure);
             } else {
                 bmeErrorCount++;
-                Serial.printf("[BME280] Invalid reading (T=%.1f H=%.1f P=%.1f) error=%d/%d\n",
-                              rawTemp, rawHum, rawPress, bmeErrorCount, BME_MAX_ERRORS);
+                if (tempOk && humOk && pressOk && !changeOk) {
+                    Serial.printf("[BME280] Sudden change rejected (T=%.1f H=%.1f P=%.1f) error=%d/%d\n",
+                                  rawTemp, rawHum, rawPress, bmeErrorCount, BME_MAX_ERRORS);
+                } else {
+                    Serial.printf("[BME280] Invalid reading (T=%.1f H=%.1f P=%.1f) error=%d/%d\n",
+                                  rawTemp, rawHum, rawPress, bmeErrorCount, BME_MAX_ERRORS);
+                }
                 if (bmeErrorCount >= BME_MAX_ERRORS) {
                     Serial.println("[BME280] Too many errors. Attempting re-init...");
-                    bme280Available = setupBME280();
+                    bme280Available = setupBME280(true);
                     bmeErrorCount = 0;
+                    hasPreviousBmeReading = false;
+                    previousBmeTemp = previousBmeHumidity = previousBmePressure = NAN;
                     // キャッシュを無効化
                     cachedBmeTemp = cachedBmeHumidity = cachedBmePressure = NAN;
+                }
+            }
+        } else {
+            // BME280 が無効な場合、定期的に再初期化を試みる
+            static unsigned long lastBmeReinitAttempt = 0;
+            if (millis() - lastBmeReinitAttempt > 60000) { // 60秒ごと
+                Serial.println("[BME280] Periodic re-init attempt...");
+                bme280Available = setupBME280(true);
+                lastBmeReinitAttempt = millis();
+                if (bme280Available) {
+                    Serial.println("[BME280] Re-init succeeded! Resuming measurements.");
                 }
             }
         }

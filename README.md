@@ -89,6 +89,62 @@ PlatformIO でプロジェクトをビルドし、XIAO ESP32C3 にアップロ�
 ```
 *※ BME280が無効または値が異常な場合、`humidity` および `pressure` フィールドは送信されず、`temperature` はMH-Z19Bの内部温度（整数値）が使用されます。*
 
+## I2C / BME280 診断機能
+
+BME280 が長時間稼働中に応答しなくなる問題に対応するため、以下の診断・自動復帰機能を搭載しています。
+
+### 自動復帰の仕組み
+
+1. **エラー検出**: BME280 の読み取り値が妥当性範囲外の場合、連続エラーとしてカウント
+2. **急変値の除外**: 前回の正常値からの変化が大きすぎる値は異常値として破棄
+   - 温度: 1回の測定で ±2°C を超える変化
+   - 湿度: 1回の測定で ±10%RH を超える変化
+   - 気圧: 1回の測定で ±3hPa を超える変化
+   - 除外した値は前回の正常値を維持し、送信しない
+3. **再初期化トリガ**: 連続エラーが 3 回に達すると、以下の手順で再初期化を試行
+   - `Wire.end()` で I2C ペリフェラルを解放
+   - I2C バスリカバリ（SCL を最大 9 回トグルして SDA スタックを解消）
+   - `Wire.begin()` で I2C を再初期化
+   - I2C バススキャンでデバイスの存在を確認
+   - `bme.begin()` で BME280 を再初期化
+4. **定期リトライ**: 再初期化に失敗して `bme280Available = false` になった場合でも、**60 秒ごと**に再初期化を試行し続ける
+
+### シリアルログの読み方
+
+シリアルモニタ（ボーレート: 115200）で以下のログを確認できます。
+
+#### 正常動作時
+```
+[BME280] Temp: 24.3°C  Hum: 45.2%  Press: 1013.2 hPa
+```
+
+#### エラー発生〜再初期化時
+```
+[BME280] Invalid reading (T=nan H=nan P=nan) error=1/3
+[BME280] Invalid reading (T=nan H=nan P=nan) error=2/3
+[BME280] Invalid reading (T=nan H=nan P=nan) error=3/3
+[BME280] Too many errors. Attempting re-init...
+[BME280] Re-initializing (Wire.end -> recovery -> Wire.begin)...
+[I2C] Attempting bus recovery...
+[I2C] Bus released after 1 clock pulse(s)
+[I2C] SDA=1 SCL=1 after recovery
+[I2C] Scanning bus...
+[I2C] Device found at 0x77
+[I2C] Scan complete. 1 device(s) found.
+BME280 initialized successfully.
+```
+
+#### トラブルシュート用ログ一覧
+
+| ログ出力 | 意味 | 対処 |
+| :--- | :--- | :--- |
+| `[I2C] Device found at 0x77` | BME280 がバス上に見えている | ライブラリ/設定の問題の可能性。`bme.begin()` の戻り値を確認 |
+| `[I2C] Scan complete. 0 device(s) found.` | BME280 がバス上に見えない | 配線の緩み・断線、電源不良、またはセンサー故障の可能性 |
+| `[I2C] Bus released after N clock pulse(s)` | SDA がスタックしていたが SCL トグルで解消 | I2C バスのノイズや接触不良が原因。配線の見直しを推奨 |
+| `[I2C] SDA=0 SCL=1 after recovery` | リカバリ後も SDA が LOW のまま | 深刻なハードウェア問題。配線の確認やセンサーの交換を検討 |
+| `[BME280] Periodic re-init attempt...` | 60 秒ごとの自動リトライ中 | 自動復帰を待つか、配線を確認して再起動 |
+| `[BME280] Re-init succeeded! Resuming measurements.` | 自動復帰に成功 | 正常動作に復帰。一時的なバス障害だった可能性が高い |
+
 ## ライブラリ依存関係
 - MH-Z19 (wifwaf/MH-Z19)
 - Adafruit BME280 Library
