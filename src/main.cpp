@@ -2,6 +2,7 @@
 #include <MHZ19.h>
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
+#include <esp_system.h>
 #include <esp_wifi.h>
 #include <HTTPClient.h>
 #include <Wire.h>
@@ -27,7 +28,11 @@ const int SERIAL_CHANNEL = 1;
 const unsigned long SENSOR_UPDATE_INTERVAL = 5000; // 5秒間
 const uint32_t WDT_TIMEOUT_S = 30; // 30秒
 const unsigned long WIFI_RECONNECT_TIMEOUT_MS = 600000; // 10分間
+const unsigned long WIFI_RECONNECT_INITIAL_MS = 5000;   // 再接続開始間隔
+const unsigned long WIFI_RECONNECT_MAX_MS = 60000;      // 最大再接続間隔
 const unsigned long DISPLAY_INTERVAL_MS = 30000; // 30秒間
+const unsigned long HTTP_CONNECT_TIMEOUT_MS = 5000;
+const unsigned long HTTP_RESPONSE_TIMEOUT_MS = 5000;
 const unsigned long RESTART_DELAY_MS = 1000;
 const int CO2_MIN_VALID = 1;
 const int CO2_MAX_VALID = 10000;
@@ -75,38 +80,54 @@ unsigned long lastSensorUpdate = 0;
 
 // WiFi接続処理
 void connectWiFi() {
+    WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
+    WiFi.persistent(false); // 再接続のたびに設定をフラッシュへ保存しない
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-    Serial.print("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("\nWiFi connected");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
+    Serial.println("WiFi connection started");
 }
 
 // WiFi接続状態の監視
 void checkWiFiStatus() {
     static bool lastConnected = false;
-    static unsigned long lastDisconnectedTime = 0;
+    static bool disconnectTracking = false;
+    static unsigned long disconnectedSince = 0;
+    static unsigned long nextReconnectTime = 0;
+    static unsigned long reconnectInterval = WIFI_RECONNECT_INITIAL_MS;
+
+    const unsigned long now = millis();
     bool currentlyConnected = (WiFi.status() == WL_CONNECTED);
 
     if (currentlyConnected && !lastConnected) {
-        Serial.print("WiFi Reconnected. IP: ");
-        Serial.println(WiFi.localIP());
-
-        lastDisconnectedTime = 0;
+        Serial.printf("[WiFi] Connected. IP: %s RSSI: %d dBm\n",
+                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        disconnectTracking = false;
+        disconnectedSince = 0;
+        nextReconnectTime = 0;
+        reconnectInterval = WIFI_RECONNECT_INITIAL_MS;
     } else if (!currentlyConnected && lastConnected) {
         Serial.println("WiFi Disconnected. Waiting for auto-reconnect...");
-        lastDisconnectedTime = millis();
     }
 
-    // 長時間接続できない場合は再起動
-    if (!currentlyConnected && lastDisconnectedTime != 0) {
-        if (millis() - lastDisconnectedTime > WIFI_RECONNECT_TIMEOUT_MS) {
+    if (!currentlyConnected) {
+        if (!disconnectTracking) {
+            disconnectTracking = true;
+            disconnectedSince = now;
+            nextReconnectTime = now;
+            reconnectInterval = WIFI_RECONNECT_INITIAL_MS;
+            Serial.println("[WiFi] Connection unavailable");
+        }
+
+        if (now >= nextReconnectTime) {
+            Serial.printf("[WiFi] Reconnecting (next interval %lu ms)\n",
+                          reconnectInterval);
+            WiFi.reconnect();
+            nextReconnectTime = now + reconnectInterval;
+            reconnectInterval = min(reconnectInterval * 2, WIFI_RECONNECT_MAX_MS);
+        }
+
+        // 長時間接続できない場合は再起動
+        if (now - disconnectedSince > WIFI_RECONNECT_TIMEOUT_MS) {
             Serial.println("WiFi connection lost for too long. Restarting...");
             delay(RESTART_DELAY_MS);
             ESP.restart();
@@ -117,18 +138,26 @@ void checkWiFiStatus() {
 
 // CO2_Displayへのデータ送信
 void sendToDisplay() {
-    static unsigned long lastDisplayTime = 0;
-    if (millis() - lastDisplayTime < DISPLAY_INTERVAL_MS && lastDisplayTime != 0) return;
+    static unsigned long lastDisplayAttempt = 0;
+    const unsigned long now = millis();
+    if (lastDisplayAttempt != 0 && now - lastDisplayAttempt < DISPLAY_INTERVAL_MS) return;
 
-    if (WiFi.status() != WL_CONNECTED) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
     if (!sensorValid) return;
+
+    // 成功・失敗にかかわらず、次回試行まで待つ
+    lastDisplayAttempt = now;
 
     HTTPClient http;
     WiFiClient client;
 
-    Serial.println("Sending data to CO2_Display...");
+    Serial.printf("[Display] Sending data to %s...\n", DISPLAY_URL);
 
     if (http.begin(client, DISPLAY_URL)) {
+        http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+        http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
         http.addHeader("Content-Type", "application/json");
 
         JsonDocument doc;
@@ -159,7 +188,8 @@ void sendToDisplay() {
             Serial.printf("[Display] Failed, error: %s\n", http.errorToString(httpCode).c_str());
         }
         http.end();
-        lastDisplayTime = millis();
+    } else {
+        Serial.println("[Display] HTTP begin failed");
     }
 }
 
@@ -332,6 +362,7 @@ void updateSensorData() {
 
 void setup() {
     Serial.begin(DEBUG_BAUDRATE);
+    Serial.printf("Reset reason: %d\n", esp_reset_reason());
     mySerial.begin(SENSOR_BAUDRATE, SERIAL_8N1, RX_PIN, TX_PIN);
     myMHZ19.begin(mySerial);
     myMHZ19.autoCalibration(false);
@@ -344,15 +375,23 @@ void setup() {
     esp_task_wdt_add(NULL);
 
     connectWiFi();
-    // WiFiの省電力モードを有効化（発熱対策）
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-    Serial.println("WiFi Power Save enabled");
+    // 常時給電の監視端末なので、通信安定性を優先して省電力を無効化
+    esp_err_t wifiPowerSaveResult = esp_wifi_set_ps(WIFI_PS_NONE);
+    Serial.printf("WiFi Power Save disabled: %s\n",
+                  wifiPowerSaveResult == ESP_OK ? "OK" : "FAILED");
 
     updateSensorData();
 }
 
 void loop() {
     esp_task_wdt_reset();
+
+    static unsigned long lastHeartbeat = 0;
+    if (millis() - lastHeartbeat >= 10000) {
+        lastHeartbeat = millis();
+        Serial.printf("[Heartbeat] heap=%u wifi=%d rssi=%d\n",
+                      ESP.getFreeHeap(), WiFi.status(), WiFi.RSSI());
+    }
 
     checkWiFiStatus();
     updateSensorData();
